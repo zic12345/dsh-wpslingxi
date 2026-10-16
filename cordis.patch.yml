@@ -1,0 +1,4 @@
+# dsh-wpslingxi 配置包补丁：在空配置根上追加插件行。
+- insert:
+    - id: wpslingxi
+      name: 'dsh-wpslingxi'
