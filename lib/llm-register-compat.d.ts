@@ -1,0 +1,19 @@
+/**
+ * 适配器幂等注册（独立插件内的最小实现）。
+ *
+ * codearts 母插件里的同名模块还包了 Token 记账与「失效模型剔除」两层 Proxy，
+ * 那两套机制依赖母插件的 openai-gateway / dead-model-store，本独立插件不需要：
+ * - 灵犀走桌面 App 私有桥，没有经过本地 OpenAI 网关，无需网关记账；
+ * - 失效模型剔除是针对 HTTP 供应商反复失败后的自动隐藏，灵犀模型目录由桥侧
+ *   model/list 与内置兜底表提供，不参与该机制。
+ *
+ * 这里只保留「fiber 热重启竞态下重复注册不抛错」这一真正需要的语义。
+ */
+/** dsh-llm 注册目标的最小结构（只依赖 registerAdapter 方法）。 */
+export interface AdapterRegisterTarget {
+    registerAdapter(providers: readonly string[], adapter: unknown): unknown;
+}
+/**
+ * 注册 LLM 适配器；重复注册时保留先注册者并返回 undefined，不抛错。
+ */
+export declare function registerAdapterIdempotent(llm: AdapterRegisterTarget, providers: readonly string[], adapter: unknown, warn?: (message: string) => void): unknown;
