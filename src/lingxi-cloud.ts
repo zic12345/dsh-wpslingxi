@@ -80,6 +80,60 @@ export interface CreditsBalance {
   readonly enabled: boolean
 }
 
+/**
+ * 一笔「赠送智点」池条目的有效期信息（来自 balance 接口的 bonus_credits /
+ * purchased_credits 数组，2026-10-17 真机抓取）。
+ *
+ * 灵犀的赠送智点（签到/活动奖励）是**分批入账、各自独立过期**的：
+ * 每一笔有自己的 effect_time（生效）和 expire_time（到期）。
+ */
+export interface CreditPoolItem {
+  /** 当前余额（剩余未用）。 */
+  readonly balance: number
+  /** 入账总额。 */
+  readonly value: number
+  /** 已消耗。 */
+  readonly consumed: number
+  /** 生效时间（ISO 字符串）。 */
+  readonly effectTime: string
+  /** 到期时间（ISO 字符串）。 */
+  readonly expireTime: string
+  /** 来源 sku（如 ai_credits_grant = 活动赠送）。 */
+  readonly skuKey: string
+}
+
+/** 一笔积分流水（transaction/list 返回条目）。 */
+export interface CreditTransaction {
+  /** 'topup'=充值/赠送入账；'expense'=消费支出。 */
+  readonly type: 'topup' | 'expense' | string
+  /** 带符号金额：入账为正、支出为负。 */
+  readonly amount: number
+  /** 关联的任务/请求标题。 */
+  readonly taskName: string
+  /** 来源（如「灵犀客户端」）。 */
+  readonly source: string
+  /** 发生时间（ISO）。 */
+  readonly time: string
+  /** topup 条目特有：该笔的到期时间（expense 条目无）。 */
+  readonly expireTime?: string
+  /** topup 条目特有：备注（如「智点赠送」）。 */
+  readonly remark?: string
+}
+
+/** 积分明细汇总（面板展示用）。 */
+export interface CreditsDetail {
+  /** 全部赠送池条目（按到期时间升序，快到期的在前）。 */
+  readonly bonusPools: readonly CreditPoolItem[]
+  /** 近 N 天内（含今天）即将到期的赠送池条目（balance>0）。 */
+  readonly expiringSoon: readonly CreditPoolItem[]
+  /** 近 N 天到期的剩余智点合计（balance 求和）。 */
+  readonly expiringSoonTotal: number
+  /** 统计窗口的天数（本次计算用的近 N 天）。 */
+  readonly expiringWindowDays: number
+  /** 最近流水（默认取前 20 条，已按时间倒序）。 */
+  readonly recentTransactions: readonly CreditTransaction[]
+}
+
 /** 一键签到结果。 */
 export interface ClaimResult {
   /** true=今天本来就已签到（本次没有新发奖）；false=本次真的领到了。 */
@@ -168,6 +222,32 @@ interface BalanceRaw {
   total_balance?: number
   total_bonus?: number
   total_purchased?: number
+  /** 赠送智点池（分批、各自带过期时间）。 */
+  bonus_credits?: RawPoolItem[]
+  /** 购买智点池（通常为空数组）。 */
+  purchased_credits?: RawPoolItem[]
+}
+
+/** 一个池条目的原始形状。 */
+interface RawPoolItem {
+  balance?: number
+  value?: number
+  consumed?: number
+  effect_time?: string
+  expire_time?: string
+  sku_key?: string
+}
+
+/** 把原始池条目规整为 {@link CreditPoolItem}。 */
+function toPoolItem(raw: RawPoolItem): CreditPoolItem {
+  return {
+    balance: raw.balance ?? 0,
+    value: raw.value ?? 0,
+    consumed: raw.consumed ?? 0,
+    effectTime: raw.effect_time ?? '',
+    expireTime: raw.expire_time ?? '',
+    skuKey: raw.sku_key ?? '',
+  }
 }
 
 /** 查询智点余额。 */
@@ -179,6 +259,92 @@ export async function getCreditsBalance(sid: string): Promise<CreditsBalance> {
     totalPurchased: raw.total_purchased ?? 0,
     enabled: raw.enabled ?? true,
   }
+}
+
+/* ------------------------------ 积分明细/到期 ------------------------------ */
+
+/**
+ * 查询积分明细：赠送池全量（含有效期）+ 近 N 天到期统计 + 最近流水。
+ *
+ * 三个数据来源：
+ * 1. `/credits/balance` 的 `bonus_credits` 数组——每一笔赠送智点都有独立的
+ *    `expire_time`，这就是「积分有效期」的权威来源；
+ * 2. `/credits/transaction/list`——最近的收支流水（topup/expense 混合倒序）。
+ *
+ * @param expiringDays 「近期到期」的统计窗口天数（默认 3 天）。
+ */
+export async function getCreditsDetail(sid: string, expiringDays = 3): Promise<CreditsDetail> {
+  // ① 余额接口里的赠送池（已含到期时间）。
+  const balance = await cloudFetch<BalanceRaw>(sid, '/credits/balance')
+  const pools = (balance.bonus_credits ?? []).map(toPoolItem)
+  // 按到期时间升序（早到期的在前），空 expire_time 的排末尾。
+  pools.sort((a, b) => {
+    if (!a.expireTime && !b.expireTime) return 0
+    if (!a.expireTime) return 1
+    if (!b.expireTime) return -1
+    return a.expireTime.localeCompare(b.expireTime)
+  })
+
+  // ② 计算「近 N 天到期」窗口：从现在起 expiringDays 天内会过期、且仍有余额的条目。
+  const now = Date.now()
+  const windowMs = expiringDays * 24 * 60 * 60 * 1000
+  const expiringSoon = pools.filter((item) => {
+    if (item.balance <= 0 || !item.expireTime) return false
+    const expireMs = Date.parse(item.expireTime)
+    if (Number.isNaN(expireMs)) return false
+    // 已过期的也算「即将到期/已到期预警」窗口内。
+    return expireMs - now <= windowMs
+  })
+  const expiringSoonTotal = expiringSoon.reduce((sum, item) => sum + item.balance, 0)
+
+  // ③ 最近流水（默认 20 条）。
+  const txList = await fetchCreditTransactions(sid, 20)
+
+  return {
+    bonusPools: pools,
+    expiringSoon,
+    expiringSoonTotal,
+    expiringWindowDays: expiringDays,
+    recentTransactions: txList,
+  }
+}
+
+/** 流水列表原始响应。 */
+interface TransactionListRaw {
+  list?: Array<{
+    type?: string
+    amount?: number
+    task_name?: string
+    source?: string
+    time?: string
+    remark?: string
+    expire_time?: string
+  }>
+  has_more?: boolean
+}
+
+/**
+ * 拉取最近的积分流水。
+ *
+ * 真机参数：`page` + `page_size`（2026-10-17 实测有效；limit 参数无效）。
+ */
+export async function fetchCreditTransactions(
+  sid: string,
+  pageSize = 20,
+): Promise<CreditTransaction[]> {
+  const raw = await cloudFetch<TransactionListRaw>(
+    sid,
+    `/credits/transaction/list?page=1&page_size=${pageSize}`,
+  )
+  return (raw.list ?? []).map((item) => ({
+    type: item.type ?? 'expense',
+    amount: item.amount ?? 0,
+    taskName: item.task_name ?? '',
+    source: item.source ?? '',
+    time: item.time ?? '',
+    remark: item.remark,
+    expireTime: item.expire_time,
+  }))
 }
 
 /* --------------------------------- 签到任务 -------------------------------- */

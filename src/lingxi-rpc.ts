@@ -23,6 +23,7 @@ import { detectWsl, type WslEnvironment } from './lingxi-win32.js'
 import {
   claimDailyCheckIn,
   getCreditsBalance,
+  getCreditsDetail,
   getDailyCheckIn,
   LingxiCloudError,
 } from './lingxi-cloud.js'
@@ -100,6 +101,19 @@ export function registerLingxiRpc(ctx: Context, env?: WslEnvironment): void {
         } catch (error) {
           if (error instanceof LingxiCloudError && error.isUnauthorized) {
             return { ok: true, value: await getCreditsBalance(await resolveSid(true)) }
+          }
+          throw error
+        }
+      }
+
+      // 积分明细：赠送池有效期 + 近 3 天到期统计 + 最近流水。
+      if (method === 'credits.detail') {
+        const sid = await resolveSid()
+        try {
+          return { ok: true, value: await getCreditsDetail(sid, 3) }
+        } catch (error) {
+          if (error instanceof LingxiCloudError && error.isUnauthorized) {
+            return { ok: true, value: await getCreditsDetail(await resolveSid(true), 3) }
           }
           throw error
         }

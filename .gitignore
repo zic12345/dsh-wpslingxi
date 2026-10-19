@@ -1,4 +1,7 @@
 node_modules/
-lib/
 *.tsbuildinfo
 .DS_Store
+# 本地在仓库内跑 pnpm 产生的生成物，不属于插件发布内容
+pnpm-lock.yaml
+pnpm-workspace.yaml
+*.map
