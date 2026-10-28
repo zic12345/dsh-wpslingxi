@@ -47,6 +47,26 @@ export declare function toDirectMessages(messages: readonly GenerateOptions['mes
  *
  * `deferLoading` 是 Anthropic 的延迟加载语义，灵犀不支持，直接忽略
  * （工具全量下发）。
+ *
+ * ## 为什么必须清洗 `parameters`（v2.0.1 修复）
+ *
+ * 灵犀云端的 `agent-runtime/chat/completions` 对 JSON Schema 的容忍度远低于
+ * 标准 OpenAI：只要有一个工具的参数 schema 里出现「没有 `type` 的节点」，
+ * 整个请求就直接返回 `{"code":"AIError","message":"AI服务异常"}`（HTTP 200，
+ * 无任何细节）。实测触发条件（2026-10-28）：
+ *
+ * - `{ anyOf: [...] }` / `{ oneOf: [...] }` / `{ allOf: [...] }` 缺兄弟 `type`；
+ * - 节点只有 `description` 而没有 `type`；
+ * - `type: ['string','object']` 这种联合类型数组（报 `InvalidArgument`）。
+ *
+ * DSH 内置的 360 个工具里有 8 个踩中（`compress`、`jev_ask`、
+ * `schedule_create`、`schedule_update`、`task_board_update`、`univer_lint`、
+ * `univer_screenshot`、`validate_dsh_ui`），因此只要不清洗，**任何真实 DSH
+ * 会话都必然失败**——这正是 v2.0 上线后「跑不通」的根因。
+ *
+ * 清洗策略（见 {@link normalizeSchema}）：把组合子折叠成首个分支（保留同层
+ * 的 `description` 等字段），并给每个节点补上 `type`（缺省 `string`）。
+ * 实测折叠后 360 个工具全部通过，且模型仍能正确调用（工具名与参数不变）。
  */
 export declare function toDirectTools(tools: readonly {
     name: string;

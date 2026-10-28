@@ -166,6 +166,26 @@ export function toDirectMessages(
  *
  * `deferLoading` 是 Anthropic 的延迟加载语义，灵犀不支持，直接忽略
  * （工具全量下发）。
+ *
+ * ## 为什么必须清洗 `parameters`（v2.0.1 修复）
+ *
+ * 灵犀云端的 `agent-runtime/chat/completions` 对 JSON Schema 的容忍度远低于
+ * 标准 OpenAI：只要有一个工具的参数 schema 里出现「没有 `type` 的节点」，
+ * 整个请求就直接返回 `{"code":"AIError","message":"AI服务异常"}`（HTTP 200，
+ * 无任何细节）。实测触发条件（2026-10-28）：
+ *
+ * - `{ anyOf: [...] }` / `{ oneOf: [...] }` / `{ allOf: [...] }` 缺兄弟 `type`；
+ * - 节点只有 `description` 而没有 `type`；
+ * - `type: ['string','object']` 这种联合类型数组（报 `InvalidArgument`）。
+ *
+ * DSH 内置的 360 个工具里有 8 个踩中（`compress`、`jev_ask`、
+ * `schedule_create`、`schedule_update`、`task_board_update`、`univer_lint`、
+ * `univer_screenshot`、`validate_dsh_ui`），因此只要不清洗，**任何真实 DSH
+ * 会话都必然失败**——这正是 v2.0 上线后「跑不通」的根因。
+ *
+ * 清洗策略（见 {@link normalizeSchema}）：把组合子折叠成首个分支（保留同层
+ * 的 `description` 等字段），并给每个节点补上 `type`（缺省 `string`）。
+ * 实测折叠后 360 个工具全部通过，且模型仍能正确调用（工具名与参数不变）。
  */
 export function toDirectTools(
   tools: readonly { name: string; description: string; parameters: Record<string, unknown> }[] | undefined,
@@ -176,7 +196,49 @@ export function toDirectTools(
     function: {
       name: tool.name,
       description: tool.description,
-      parameters: tool.parameters,
+      parameters: normalizeSchema(tool.parameters) as Record<string, unknown>,
     },
   }))
+}
+
+/** JSON Schema 组合子关键字（灵犀云端不接受缺 `type` 的这三种）。 */
+const COMBINATOR_KEYS = ['anyOf', 'oneOf', 'allOf'] as const
+
+/**
+ * 把 DSH 的 JSON Schema 规范化为灵犀云端能接受的形状。
+ *
+ * 递归处理 `properties` / `items` / 组合子分支，规则：
+ * 1. 遇到 `anyOf`/`oneOf`/`allOf` 时，**折叠成第一个分支**（同层其它字段，
+ *    如 `description`，优先级更高）；分支为空则退化为 `{type:'string'}`。
+ * 2. 任何节点缺 `type`（或 `type` 不是字符串，如联合类型数组）时补 `string`。
+ *
+ * 折叠而不是删除的原因：删掉组合子会丢掉分支里的 `properties`/`items`，
+ * 让模型看不到参数结构（实测直接删会触发 `InvalidArgument`）；折叠既满足
+ * 云端的「必须有 type」要求，又保留了第一个分支的完整结构。
+ */
+function normalizeSchema(node: unknown): unknown {
+  if (Array.isArray(node)) return node.map(normalizeSchema)
+  if (!node || typeof node !== 'object') return node
+
+  let out: Record<string, unknown> = { ...(node as Record<string, unknown>) }
+
+  const combinator = COMBINATOR_KEYS.find((key) => Array.isArray(out[key]))
+  if (combinator) {
+    const branches = out[combinator] as unknown[]
+    delete out[combinator]
+    const first = branches.length > 0 ? normalizeSchema(branches[0]) : { type: 'string' }
+    // 同层字段（description 等）覆盖分支里的同名字段。
+    out = { ...(first as Record<string, unknown>), ...out }
+  }
+
+  if (typeof out.type !== 'string') out.type = 'string'
+
+  if (out.properties && typeof out.properties === 'object') {
+    out.properties = Object.fromEntries(
+      Object.entries(out.properties as Record<string, unknown>).map(([key, value]) => [key, normalizeSchema(value)]),
+    )
+  }
+  if (out.items !== undefined) out.items = normalizeSchema(out.items)
+
+  return out
 }
