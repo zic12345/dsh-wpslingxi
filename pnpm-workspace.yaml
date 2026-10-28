@@ -1,0 +1,5 @@
+# 单包仓库：这里只用于声明 pnpm 12 的构建脚本授权。
+# pnpm 12 把 onlyBuiltDependencies / allowBuilds 从 package.json 移到了本文件，
+# 不声明就会在每次 install 时报 ERR_PNPM_IGNORED_BUILDS: Ignored build scripts: esbuild。
+allowBuilds:
+  esbuild: true
