@@ -1,21 +1,23 @@
 /**
- * WPS 灵犀（桌面版）provider 的静态模型目录与共享类型。
+ * WPS 灵犀 provider 的静态模型目录与共享类型。
  *
  * 模型字段来自真机 `model/list`（2026-10-12，app-server v68 / 桌面 4.27.0，
- * 13 个内置模型，provider 恒为 `lingxi`）。灵犀的模型集合由其 app-server
- * 下发、随版本变化；这里保留一份**兜底内置目录**，使未启动桥（未装桌面版 /
- * WSL 外环境）时仍有可展示的模型，桥连上后可用远端 model/list 覆盖。
+ * 13 个内置模型，provider 恒为 `lingxi`）。v2.0 直连云端后不再调用
+ * `model/list`（云端按请求里的模型名路由，未知名回落默认模型），因此这份
+ * 目录就是**唯一**的模型清单；增删模型直接改这里。
+ *
+ * 真机实测（2026-10-28）：13 个名字全部被云端接受并返回 200。
  */
 
 /** 一个内置模型的目录条目（字段对齐 model/list 的下发形状）。 */
 export interface LingxiModelEntry {
-  /** run/start 与 expect_model 用的模型标识。 */
+  /** 请求体 `model` 字段用的模型标识。 */
   readonly modelName: string
   /** 展示名。 */
   readonly name: string
   /** 一句话介绍（intro / desc）。 */
   readonly intro: string
-  /** 是否支持多模态（灵犀的多模态走桌面 App，DSH 文本桥暂不投递图片）。 */
+  /** 是否支持多模态（v2.0 直连按纯文本接入，暂不投递图片）。 */
   readonly multimodal: boolean
   /** 最大上下文 token（max_context_tokens）。 */
   readonly contextTokens: number
@@ -44,34 +46,10 @@ export const LINGXI_FALLBACK_MODELS: readonly LingxiModelEntry[] = [
   { modelName: 'doubao_seed_2_1_pro_260628', name: 'Doubao-Seed-2.1 Pro', intro: '适用于综合业务场景', multimodal: true, contextTokens: 262144, maxNewTokens: 262144, reasoningEfforts: ['low', 'high', 'max'] },
 ]
 
-/** 默认模型（run/start 缺省 model_name 为 max）。 */
+/** 默认模型（灵犀桌面版缺省即 max）。 */
 export const LINGXI_DEFAULT_MODEL = 'max'
 
 /** 按 model_name 查兜底条目。 */
 export function findFallbackModel(modelName: string): LingxiModelEntry | undefined {
   return LINGXI_FALLBACK_MODELS.find((entry) => entry.modelName === modelName)
-}
-
-/** 把远端 model/list 的原始模型对象归一为目录条目（失败回退 undefined）。 */
-export function normalizeRemoteModel(raw: unknown): LingxiModelEntry | undefined {
-  if (typeof raw !== 'object' || raw === null) return undefined
-  const record = raw as Record<string, unknown>
-  const modelName = record.model_name
-  if (typeof modelName !== 'string' || !modelName) return undefined
-  const efforts = Array.isArray(record.reasoning_efforts)
-    ? record.reasoning_efforts.filter((value): value is 'low' | 'high' | 'max' =>
-        value === 'low' || value === 'high' || value === 'max')
-    : []
-  const asInt = (value: unknown, fallback: number): number =>
-    typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback
-  return {
-    modelName,
-    name: typeof record.name === 'string' && record.name ? record.name : modelName,
-    intro: typeof record.intro === 'string' ? record.intro
-      : typeof record.desc === 'string' ? record.desc : '',
-    multimodal: record.support_multimodal === true,
-    contextTokens: asInt(record.max_context_tokens, 1048576),
-    maxNewTokens: asInt(record.max_new_tokens, 131072),
-    reasoningEfforts: efforts,
-  }
 }

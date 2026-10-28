@@ -1,56 +1,67 @@
 # dsh-wpslingxi
 
-在 **WSL** 中运行的 DSH 里使用 **Windows 宿主上「WPS 灵犀」桌面版**的能力：
+在 **WSL** 中运行的 DSH 里使用 **WPS 灵犀**的能力：
 
-1. **灵犀模型路由**：把灵犀桌面版内置的 13 个模型（Max/Pro、DeepSeek、GLM、Kimi、Qwen、MiniMax、豆包等）注册为 DSH 的 `lingxi` provider，可直接用于对话/编码；
+1. **灵犀模型路由**：把灵犀的 13 个模型（Max/Pro、DeepSeek、GLM、Kimi、Qwen、MiniMax、豆包等）注册为 DSH 的 `lingxi` provider。**v2.0 直连灵犀云端 LLM**，原生支持工具调用 —— 模型可以调用 DSH 的全部工具（宿主 PowerShell、WSL bash、文件读写、子代理……），agent 循环跑在 DSH 里；
 2. **插件设置页（收纳进内置「插件」Tab）**：客户端不占左侧独立图标，而是在 DSH
    自带的 **设置 → 插件** 页里注册一个名为「WPS 灵犀」的 Tab（槽位
-   `settings.plugins.tab`），提供一键**每日签到领智点**、当前**智点余额**与连签日历；
-   面板经 `connection.fetch` 的 `/api/wpslingxi` RPC 调宿主侧签到/余额接口。
+   `settings.plugins.tab`），提供一键**每日签到领智点**、当前**智点余额与到期明细**、最近积分流水；
+   面板经 `connection.fetch` 的 `/api/wpslingxi` RPC 调宿主侧接口。
 
-> 只在 WSL 下可用（要读取 Windows 宿主的灵犀安装与登录态）。非 WSL 环境插件会加载但模型不注册，面板会提示环境原因。
+> 只在 WSL 下可用（要读取 Windows 宿主的灵犀登录态）。非 WSL 环境插件会加载但模型不注册，面板会提示环境原因。
 
 ---
 
-## 它是怎么工作的
+## 它是怎么工作的（v2.0）
 
-灵犀桌面版**没有**公开的 OpenAI 兼容 API，也没有 API Key：模型能力只由本地的
-`lingxi.exe` 通过 stdio JSON-RPC 暴露，鉴权用的是登录后保存在 Windows 里的 `wps_sid`
-cookie（DPAPI + AES-256-GCM 加密）。因此本插件做了三件事：
+灵犀桌面版**没有** API Key，鉴权用的是登录后保存在 Windows 里的 `wps_sid` cookie
+（DPAPI + AES-256-GCM 加密）。2026-10-28 抓包确认：桌面 `lingxi.exe` 本身也只是个
+HTTP 客户端，agent 循环全在本地，云端只提供**一个纯 LLM 接口**
+`POST /api/public/v1/agent-runtime/chat/completions`（OpenAI 风格，支持
+`tools` / `tool_calls`）。
+
+因此 v2.0 **直接调这个接口**，把 agent 循环交回 DSH：
 
 ```
  DSH (WSL Node)
    │  ① 读取登录态：PowerShell 复制 passport 分区 Cookies，
    │     DPAPI 解密 Chromium AES key，再 AES-GCM 解出 wps_sid
    ▼
- Windows 自带 portable node.exe          ← 两层 interop 桥（WSL 直接管 lingxi.exe 会网络异常）
-   │  boot.cjs：注入 LINGXI_WPS_SID，spawn lingxi.exe -stdin，透传 stdio
-   ▼
- lingxi.exe  ── HTTPS ──▶  lingxi.wps.cn   （模型 / 智点 / 签到）
+ 直连 HTTPS ──▶ lingxi.wps.cn
+   ├─ POST /api/aioffice/v1/cowork/sessions              → session_id
+   ├─ POST /api/public/v1/credits/runs                   → run_id（计费单位）
+   └─ POST /api/public/v1/agent-runtime/chat/completions → SSE 流式（含 tool_calls）
 ```
 
-- **模型**：每次 `stream()` = 新建一个灵犀 `cowork_client` 会话 + 一次 `run/start`，
-  把 DSH 的多轮消息渲染成单个 prompt（无状态多轮），实时收集
-  `component.content`（正文 `c_text` / 思考 `c_reasoning`）逐字回传。
+- **工具调用**：`options.tools` 原样下发，模型返回的 `tool_calls` 转成 DSH 的
+  `tool-call` 块由 DSH 执行，结果用 `role:'tool'` 回传。宿主 PowerShell、WSL
+  bash、DSH 全部内置工具立即可用。
+- **系统提示词**：走灵犀的 `context` 字段（实测可整体覆盖其内置提示词），
+  上下文压缩、重试、权限审批全部由 DSH 负责。
 - **签到 / 余额**：浏览器面板 → `connection.fetch` 的 `/api/wpslingxi` RPC →
   宿主侧直接用 `wps_sid` cookie 调灵犀云端 HTTP 接口。
 
+### 为什么不再经 lingxi.exe（v1.x 路线）
+
+v1.x 经两层 stdio 桥调用桌面 `lingxi.exe`，模型跑在**灵犀自己的 agent 循环**里：
+工具是灵犀沙箱内的 bash/file/web，DSH 的工具链完全用不上，宿主 PowerShell 还被
+灵犀的双层黑名单（`sitecustomize.py` 的 Python 审计层 + `blacklist.go` 的 Go
+词法层）拦住。绕开它要么改灵犀安装文件、要么把 exe 改名，都脆弱且随版本失效。
+直连云端是**纯插件侧**的干净方案。
+
 ## 能力边界（请先读）
 
-- **仅文本输入**：图片不会投递给灵犀（面板/模型都按文本接入）。
-- **无原生 function-calling / 工具调用**：灵犀内置模型走 agent runtime，
-  不是 OpenAI Chat Completions，所以 DSH 的工具不会下发给模型；适合当**对话/推理/写作模型**。
-- **不下发 token 用量**：灵犀 run 结束不返回 token 计数，`stream()` 不伪造 usage。
-- **强依赖 Windows 宿主**：需已安装并登录「WPS 灵犀」桌面版，且 WSL 能访问 `https://lingxi.wps.cn`。
-- **工作区跟随每个 DSH 会话**：适配器拿 LLM 请求里的 `sessionId`，经宿主
-  `ctx.sessionQuery.observeSession(sessionId).header.cwd` 反查该会话的项目目录
-  （插件 `inject` 声明了 `sessionQuery`），再用 `wslpath -w` 转成 Windows 路径
-  （`/mnt/c/...` → `C:\...`；ext4 → `\\wsl.localhost\<发行版>\...` UNC，已真机验证
-  可读写）交给灵犀 agent。因此在 `/home/zic/test/lingxi` 开会话，灵犀的文件/命令
-  就落在那个目录，与 dsh web 进程自身的启动 cwd 无关。每个 sessionId 只反查/转换一次。
-  - 桥自身的 boot/data/空 skills 骨架仍放在 Windows `%TEMP%`（仅进程引导文件，不是工作区）。
-  - 可用环境变量 **`DSH_LINGXI_WORKSPACE`**（WSL 路径）强制覆盖所有会话的工作目录；
-    未设置且反查不到 cwd 时回退桥的临时工作区。
+- **仅文本输入**：图片不会投递给灵犀（`inputModalities: ['text']`）。
+- **计费按 run**：一个 DSH 会话建一个云端 run，**只扣 1 智点**，无论该会话里
+  调多少次模型（实测同 run 内 10 次调用、跨 5 分钟、含并发仍只扣 1 点）。
+  新建会话 = 新 run = 再扣 1 点。
+- **强依赖 Windows 宿主**：需**曾经**在 Windows 上登录过「WPS 灵犀」桌面版
+  （不必正在运行，只要 cookie 还在），且 WSL 能访问 `https://lingxi.wps.cn`。
+- **工作区声明**：适配器拿 LLM 请求里的 `sessionId`，经宿主
+  `ctx.sessionQuery.observeSession(sessionId).header.cwd` 反查该会话的项目目录，
+  转成 Windows 路径作为云端会话的 `work_space_dir` 声明。
+  ⚠️ v2.0 里它**不决定工具执行目录**——工具跑在 DSH 侧，天然跟随会话 cwd。
+  可用环境变量 **`DSH_LINGXI_WORKSPACE`**（WSL 路径）强制覆盖。
 - 模型与签到是两条独立旁路，一条出问题不影响另一条。
 
 ---
@@ -60,33 +71,33 @@ cookie（DPAPI + AES-256-GCM 加密）。因此本插件做了三件事：
 ```
 src/
   index.ts                插件入口：注册模型 provider + 签到/余额 RPC
-  lingxi-adapter.ts       DSH LlmAdapter（模型目录、stream、登录态失效重试）
-  lingxi-bridge.ts        WSL 侧两层桥客户端（stdio JSON-RPC 多路复用）
-  lingxi-assets/boot.cjs  Windows 侧引导脚本（spawn lingxi.exe，随包分发的静态资源）
-  lingxi-cloud.ts         灵犀云端 HTTP：智点余额 / 每日签到状态 / 领奖
+  lingxi-adapter.ts       DSH LlmAdapter（模型目录、stream、StreamChunk 翻译）
+  lingxi-direct.ts        灵犀云端直连客户端（建会话/run、SSE 解析、run 复用与重试）
+  lingxi-cloud.ts         灵犀云端 HTTP：智点余额 / 明细 / 流水 / 每日签到
   lingxi-credential.ts    从 Windows 登录态提取 wps_sid（cookie + DPAPI + AES-GCM）
   lingxi-win32.ts         WSL 探测 / PowerShell 调用（含 UTF-8 编码处理）
   lingxi-rpc.ts           /api/wpslingxi 宿主 RPC（供 Web 面板调用）
-  lingxi-messages.ts      DSH 消息 → 灵犀单 prompt 渲染
-  lingxi.ts               13 个内置模型静态目录（云端拉取失败时的兜底）
-  lingxi-product.ts / llm-register-compat.ts / message-shape.ts
+  lingxi-messages.ts      DSH 消息 → OpenAI 形状消息 + 工具定义转换
+  lingxi.ts               13 个内置模型静态目录（唯一清单）
+  lingxi-product.ts / llm-register-compat.ts
 plugin-src/client/        浏览器侧：注册到「设置 → 插件」页的「WPS 灵犀」Tab（React）
   index.js  panel.jsx  rpc.js  build.mjs
-scripts/copy-assets.mjs   把 boot.cjs 拷进 lib/
 cordis.patch.yml          作为 profile bundle 装载时向配置树插入插件行
 ```
 
 ## 从源码构建
 
-本机 devDependencies 用的是软链到母插件（`deepseek-harness-codearts`）的工具链。
 独立构建需要 Node ≥ 22.19，以及 `typescript`、`esbuild`、`@types/node`、
 `@deepseek-ai/cordis`、`@deepseek-ai/dsh-llm`（这些在 DSH 运行时由宿主提供）。
 
 ```bash
 cd dsh-wpslingxi
 pnpm install        # 若 esbuild 构建脚本被忽略：pnpm approve-builds
-pnpm build:all      # = tsc + copy-assets(boot.cjs) + esbuild(client/panel.js)
+rm -rf lib && pnpm run build:all   # = tsc + esbuild(client/panel.js)
 ```
+
+> 注意要写 `pnpm run build:all`：仓库没有 workspace 文件时，`pnpm build:all`
+> 会被当成递归 exec 而报 `ERR_PNPM_RECURSIVE_EXEC_FIRST_FAIL`。
 
 ## 安装到 DSH（web profile）
 
@@ -133,9 +144,10 @@ dsh plugin --profile web remove dsh-wpslingxi
 | 现象 | 原因 / 处理 |
 | --- | --- |
 | 面板提示「登录态失效」 | 在 Windows 打开「WPS 灵犀」桌面版重新登录，再点面板「重试」（SID 实时提取，无需重启 DSH） |
-| 模型列表为空 / 无 `lingxi` provider | 不在 WSL、没装桌面版、或没登录；查看 DSH 日志里 `[lingxi]` 警告 |
-| 面板/模型报网络异常 | 确认 WSL 能访问 `https://lingxi.wps.cn`（默认无需宿主代理） |
-| 找不到 `lingxi.exe` | 插件在 `%APPDATA%\WPS 灵犀\app_server_link\service` 与安装目录下探测；用的是桌面版自带 portable node |
+| 模型列表为空 / 无 `lingxi` provider | 不在 WSL、或从未登录过桌面版；查看 DSH 日志里 `[lingxi]` 警告 |
+| 模型报网络异常 | 确认 WSL 能访问 `https://lingxi.wps.cn`（默认无需宿主代理） |
+| 对话报「数据不存在 / SQLNoRows」 | 云端 run 过期，客户端会自动重建并重试一次 |
+| 回复为空但用了智点 | `max_tokens` 太小，预算被思考内容吃光；DSH 侧调大 maxTokens |
 | PowerShell 输出中文乱码导致路径损坏 | 已在生成的脚本里强制 `[Console]::OutputEncoding=UTF8`（PS 5.1 默认 GBK） |
 
 ## 隐私 / 安全说明

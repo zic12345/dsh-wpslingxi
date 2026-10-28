@@ -1,23 +1,55 @@
 /**
- * 灵犀消息序列化。
+ * DSH 消息 → 灵犀云端 OpenAI 形状消息的转换。
  *
- * 灵犀桌面 agent runtime **不提供原生 function-calling 通道**：它只接受一个
- * `agent_input.text` 自由文本，回复也是正文/思考两块文本。故本 provider 以
- * 「对话/推理模型」身份接入 DSH——
+ * ## v2.0 与 v1.x 的根本区别
  *
- * - 入参 `messages`（system/user/assistant/tool 及各类 ContentBlock）被**渲染成
- *   一段带角色标签的转录文本**，让模型在单轮无状态调用里读到完整上下文；
- * - 工具调用/工具结果降级为转录行（保留「调了什么、返回了什么」），不产出
- *   `tool-call` chunk，因此不会驱动 DSH 的工具执行循环。需要 agentic 工具时
- *   用户应选用支持原生工具的 provider；灵犀定位是对话/写作/推理。
+ * v1.x 走灵犀 agent 循环时没有 function-calling 通道，只能把整段历史**渲染成
+ * 一段带角色标签的纯文本**（模型看不到结构化的工具调用，DSH 的工具循环也
+ * 因此无法驱动）。
  *
- * 无状态多轮已真机验证（/tmp/lxdrv/poc.js：把 system+历史渲染成单条 text，
- * 新 session 能正确回答历史里的算术）。
+ * v2.0 直连云端的 `chat/completions`，它支持**标准 OpenAI 工具协议**：
+ * `tools` 下发定义、`tool_calls` 发起调用、`role:'tool'` 回传结果。故本模块
+ * 做的是**结构化映射**而非文本渲染：
+ *
+ * | DSH | 云端 wire |
+ * |---|---|
+ * | `role:'system'` / `options.system` | `context` 字段（灵犀专有，覆盖其内置提示词） |
+ * | `role:'user'` + text 块 | `{role:'user', content}` |
+ * | `role:'assistant'` + text 块 | `{role:'assistant', content}` |
+ * | `role:'assistant'` + tool-call 块 | `{role:'assistant', content:'', tool_calls:[...]}` |
+ * | `role:'tool'`（0.1.7+ 一等消息） | `{role:'tool', tool_call_id, content}` |
+ * | `role:'developer'` | **丢弃**（只承载工具增删元数据） |
+ *
+ * 图片/文件块降级为占位文本：灵犀这一路按纯文本接入（DSH 侧
+ * `inputModalities:['text']` 已如实声明，正常不会投递图片）。
  */
 import type { GenerateOptions } from '@deepseek-ai/dsh-llm';
+import type { DirectChatMessage, DirectToolSchema } from './lingxi-direct.js';
+/** 转换结果：wire 消息 + 抽出的系统提示词。 */
+export interface ConvertedMessages {
+    /** 下发给 `messages` 字段的消息（不含 system）。 */
+    readonly messages: DirectChatMessage[];
+    /** 下发给 `context` 字段的系统提示词（可能为空）。 */
+    readonly system: string;
+}
 /**
- * 把 DSH 消息数组渲染成灵犀单条 prompt。
+ * 把 DSH 的 messages 转换成云端 OpenAI 形状。
  *
- * @param optionsSystem GenerateOptions.system（一次性调用者用），并入最前。
+ * @param messages DSH 传入的完整历史（`GenerateOptions.messages`）
+ * @param optionsSystem `GenerateOptions.system`（一次性调用者用）
  */
-export declare function serializeLingxiPrompt(messages: readonly GenerateOptions['messages'][number][], optionsSystem?: string): string;
+export declare function toDirectMessages(messages: readonly GenerateOptions['messages'][number][], optionsSystem?: string): ConvertedMessages;
+/**
+ * 把 DSH 的工具定义转换成云端 OpenAI 形状。
+ *
+ * DSH 的 `ToolSchema` 已经是 `{name, description, parameters}`，只需包上
+ * `{type:'function', function:{...}}` 外层。
+ *
+ * `deferLoading` 是 Anthropic 的延迟加载语义，灵犀不支持，直接忽略
+ * （工具全量下发）。
+ */
+export declare function toDirectTools(tools: readonly {
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>;
+}[] | undefined): DirectToolSchema[] | undefined;

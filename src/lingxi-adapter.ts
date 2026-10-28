@@ -1,40 +1,50 @@
 /**
- * WPS 灵犀（桌面版）DSH 适配器。
+ * WPS 灵犀 DSH 适配器（v2.0：直连云端，DSH 主导 agent 循环）。
  *
- * 与本插件其它 provider 不同，灵犀**没有云端 OpenAI 兼容端点、没有 API Key、
- * 也没有可在设置页填写的 baseURL**——模型能力只经桌面 App 自带的
- * `lingxi.exe`（app-server）以 stdio JSON-RPC 暴露。在 WSL 里还要跨过
- * 两层 interop（WSL Node → 灵犀 portable node.exe → boot.cjs → lingxi.exe），
- * 详见 {@link LingxiBridge} 与 src/lingxi-assets/boot.cjs 的头部注释。
+ * ## 与 v1.x 的根本差异
  *
- * 因此本适配器：
- * - **不进** provider-registry / provider-runtime / Jet Hub 账号池（无登录 UI、
- *   无 HTTP 限流、无余额面板），只在成功探测到 WSL + 桌面登录态时注册 `ctx.llm` 路由；
- * - 凭据（wps_sid）由 {@link extractWpsSid} 自动从桌面 App 的登录 cookie 提取，
- *   也允许 `DSH_LINGXI_WPS_SID` 覆盖；
- * - 每次 `stream()` 是一次**无状态**对话：把 messages 渲染成单条 prompt，
- *   新建 session + run，实时消费 component 事件产出 StreamChunk。
- * - 灵犀无原生 function-calling，工具调用/结果降级为转录文本（见 lingxi-messages.ts）。
+ * v1.x 把对话交给桌面 `lingxi.exe`（app-server），模型跑在**灵犀自己的
+ * agent 循环**里：工具是灵犀沙箱内的 bash/file/web，DSH 的工具链完全用不上，
+ * 宿主 PowerShell 还被灵犀的双层黑名单拦住（Python 审计层 + Go 词法层）。
+ *
+ * v2.0 直接调云端 `POST /api/public/v1/agent-runtime/chat/completions`
+ * （OpenAI 风格，支持 `tools`/`tool_calls`），**agent 循环交回 DSH**：
+ *
+ * - 工具：`options.tools` 原样下发，模型返回的 `tool_calls` 转成 DSH 的
+ *   `tool-call` 块，DSH 执行完再用 `role:'tool'` 回传 → 宿主 PowerShell、
+ *   WSL bash、DSH 全部内置工具立即可用；
+ * - 系统提示词：走灵犀的 `context` 字段（真机抓包确认可整体覆盖其内置提示词）；
+ * - 上下文/压缩/重试/审批：全部由 DSH 负责，灵犀只当一个纯 LLM 后端。
+ *
+ * 详见 {@link LingxiDirectClient}（HTTP 客户端）与 lingxi-messages.ts（消息转换）。
+ *
+ * ## 仍然保留的能力
+ *
+ * - 凭据：`wps_sid` 由 {@link extractWpsSid} 从桌面 App 登录态自动提取
+ *   （DPAPI + AES-256-GCM 解 Chromium cookie），也允许 `DSH_LINGXI_WPS_SID` 覆盖；
+ * - 计费：按 run 计（一个 DSH 会话 1 智点），见 {@link LingxiDirectClient}；
+ * - 设置页的签到/智点面板：与 LLM 通道共用同一个 SID，互不影响。
  */
-import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { LlmAdapter, LlmError, ReasoningEffortId, ToolCallId } from '@deepseek-ai/dsh-llm'
 import type {
+  ContentBlock,
   GenerateOptions,
   LlmModelInfo,
   LlmModelReasoningInfo,
   LlmProviderInfo,
   LlmResolvedModelInfo,
   StreamChunk,
+  TokenUsage,
 } from '@deepseek-ai/dsh-llm'
 import type { Context } from '@deepseek-ai/cordis'
 import { detectWsl, resolveLingxiWorkspaceOverride, wslPathToWindows, type WslEnvironment } from './lingxi-win32.js'
 import { extractWpsSid } from './lingxi-credential.js'
-import { detectLingxiHost, LingxiBridge, type LingxiHost } from './lingxi-bridge.js'
-import { serializeLingxiPrompt } from './lingxi-messages.js'
+import { LingxiDirectClient, type DirectToolCall } from './lingxi-direct.js'
+import { toDirectMessages, toDirectTools } from './lingxi-messages.js'
 import {
   LINGXI_DEFAULT_MODEL,
   LINGXI_FALLBACK_MODELS,
   findFallbackModel,
-  normalizeRemoteModel,
   type LingxiModelEntry,
 } from './lingxi.js'
 import { LINGXI } from './lingxi-product.js'
@@ -44,14 +54,13 @@ import { registerAdapterIdempotent } from './llm-register-compat.js'
 export interface LingxiAdapterOptions {
   /** 强制注入 WSL 环境（测试用）；缺省时运行时探测。 */
   env?: WslEnvironment
-  /** 强制注入桥工厂（测试用）。 */
-  bridgeFactory?: (host: LingxiHost, sid: string) => Promise<LingxiBridge>
   /**
    * 按 DSH 会话 id 解析该会话的项目工作目录（**WSL 路径**）。
    *
    * 由 index.ts 用宿主 `ctx.sessionQuery.observeSession(sessionId).header.cwd`
-   * 实现并注入：LLM 的 GenerateOptions 不携带工作区，只携带 sessionId，
-   * 每个会话的 cwd 必须这样反查，才能做到「跟随当前会话工作区」。
+   * 实现并注入：LLM 的 GenerateOptions 不携带工作区，只携带 sessionId。
+   * v2.0 里该路径只用于在云端会话上**声明**工作区（不影响工具执行，
+   * 工具跑在 DSH 侧的真实 cwd 里）。
    */
   resolveSessionCwd?: (sessionId: string) => Promise<string | undefined>
 }
@@ -65,33 +74,14 @@ interface LingxiSessionQueryLike {
   observeSession(sessionId: string): Promise<LingxiSessionObservation>
 }
 
-/** 队列事件：把桥的同步回调搬进 async generator。 */
-type QueueEvent =
-  | { kind: 'start'; componentId: string; blockKind: 'reasoning' | 'text'; index: number }
-  | { kind: 'delta'; index: number; blockKind: 'reasoning' | 'text'; text: string }
-  | { kind: 'error'; error: Error }
-
-/** 判定桥错误是否属于登录态失效（需要重新提取 SID 后整体重建桥）。 */
-function isAuthFailure(error: unknown): boolean {
-  const code = (error as { code?: unknown } | undefined)?.code
-  if (typeof code === 'number') {
-    // 灵犀网关 401 段错误码（v7code 401xxxxx 等）；保守只认明确未登录/未授权。
-    return code === 401 || code === 40101 || code === 401020001
-  }
-  const text = (error as Error | undefined)?.message ?? ''
-  return /未登录|登录态|unauthorized|unauthenticated|401|UserUnauthorized/i.test(text)
-}
-
 export class LingxiAdapter extends LlmAdapter {
   private env: WslEnvironment | undefined
-  private host: LingxiHost | undefined
-  private bridge: LingxiBridge | undefined
-  /** 单飞的建桥 Promise，避免并发请求重复拉起进程。 */
-  private bridgePromise: Promise<LingxiBridge> | undefined
+  /** 直连客户端（进程级单例，内部按 sessionId 缓存 run）。 */
+  private client: LingxiDirectClient | undefined
   /** 远端刷新过的模型目录（未刷新前用内置兜底目录）。 */
   private remoteModels: LingxiModelEntry[] | undefined
   /**
-   * 每个 DSH 会话解析出的灵犀工作目录（Windows 路径），按 sessionId 缓存。
+   * 每个 DSH 会话解析出的工作区（Windows 路径），按 sessionId 缓存。
    * 会话 cwd 固定，只反查一次；wslpath 转换同样缓存（按 WSL 路径）。
    */
   private readonly sessionWorkspace = new Map<string, string | undefined>()
@@ -101,18 +91,15 @@ export class LingxiAdapter extends LlmAdapter {
     super()
   }
 
-  /** 注册阶段已探测过宿主时注入，省去首次请求的重复 interop 探测。 */
-  primeHost(host: LingxiHost): void {
-    this.host = host
-  }
-
   override providerInfo(_provider: string): LlmProviderInfo {
     return { id: LINGXI.id, name: LINGXI.displayName }
   }
 
   /**
-   * 对外可展示的模型：默认直接返回内置目录（GUI 不能被一次昂贵的 interop
-   * 建桥拖住）。后台不主动刷新——首次真实对话建桥后目录已可用，下次列表即更新。
+   * 对外可展示的模型：直接返回内置目录。
+   *
+   * 云端 `model/list` 已不再需要（直连时模型名就是请求字段，网关按名路由），
+   * 故列表纯本地、零延迟。
    */
   override async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
     const entries = this.remoteModels ?? LINGXI_FALLBACK_MODELS
@@ -124,7 +111,7 @@ export class LingxiAdapter extends LlmAdapter {
     model: string,
     _signal?: AbortSignal,
   ): Promise<LlmResolvedModelInfo> {
-    // 纯本地元数据，不触发 interop；未知 model id 也放行（核心路由接受未列名模型）。
+    // 纯本地元数据，不发网络请求；未知 model id 也放行（网关按名路由）。
     const entry = findFallbackModel(model)
     const base = this.toModelInfo(entry ?? {
       modelName: model,
@@ -152,7 +139,7 @@ export class LingxiAdapter extends LlmAdapter {
       id: entry.modelName,
       name: entry.name,
       description: entry.intro || undefined,
-      // 文本桥暂不投递图片；即便桌面模型多模态，DSH 这一路只声明文本。
+      // 直连通道按纯文本接入：图片/文件不投递（DSH 据此不会给出图片附件）。
       inputModalities: ['text'],
     }
   }
@@ -169,8 +156,6 @@ export class LingxiAdapter extends LlmAdapter {
         id: ReasoningEffortId(id),
         name: labels[id],
       })),
-      // 不强制默认档：灵犀按 expect_model 选模型，思考档由其内部策略处理，
-      // DSH 侧选了档位目前不透传（run/start 无对应字段），仅做能力播报。
     }
   }
 
@@ -178,21 +163,33 @@ export class LingxiAdapter extends LlmAdapter {
   private async ensureEnv(): Promise<WslEnvironment> {
     if (this.env) return this.env
     const env = this.options.env ?? detectWsl()
-    if (!env) throw new Error('WPS 灵犀桌面 provider 仅在 WSL 环境可用（未检测到 WSL）')
+    if (!env) throw new Error('WPS 灵犀 provider 仅在 WSL 环境可用（未检测到 WSL）')
     this.env = env
     return env
   }
 
   /**
-   * 解析本次 LLM 请求应交给灵犀 agent 的工作目录（Windows 路径），**跟随会话**。
+   * 取直连客户端（单例）。SID 在首次真正请求时才提取，避免注册阶段
+   * 拖慢启动；401 由客户端内部强制重取。
+   */
+  private async getClient(): Promise<LingxiDirectClient> {
+    if (this.client) return this.client
+    const env = await this.ensureEnv()
+    this.client = new LingxiDirectClient(async (force) => extractWpsSid(env, force))
+    return this.client
+  }
+
+  /**
+   * 解析本次请求应声明给云端的会话工作区（Windows 路径）。
    *
    * 优先级：
    * 1. 环境变量 DSH_LINGXI_WORKSPACE（显式覆盖，全局固定）；
    * 2. 当前 DSH 会话的项目目录——用 GenerateOptions.sessionId 经注入的
    *    resolveSessionCwd 反查 `sessionQuery.observeSession(...).header.cwd`；
-   * 3. 都拿不到时返回 undefined，由桥回退到它自己的临时工作区。
+   * 3. 都拿不到时返回 undefined（云端回退到它的默认临时目录）。
    *
-   * 每个 sessionId 只反查/转换一次（会话 cwd 固定）。
+   * ⚠️ 只用于云端会话的 `work_space_dir` 声明，**不决定工具执行目录**：
+   * v2.0 的工具全在 DSH 侧执行，天然跟随会话 cwd。
    */
   private async resolveWorkspaceWin(sessionId: string | undefined): Promise<string | undefined> {
     const overrideWsl = resolveLingxiWorkspaceOverride()
@@ -207,7 +204,6 @@ export class LingxiAdapter extends LlmAdapter {
       const cwdWsl = await this.options.resolveSessionCwd(sessionId)
       if (cwdWsl) win = this.toWindowsCached(cwdWsl)
     } catch {
-      // 反查失败（会话已结束 / sessionQuery 不可用）不致命：回退临时工作区。
       win = undefined
     }
     this.sessionWorkspace.set(sessionId, win)
@@ -229,155 +225,173 @@ export class LingxiAdapter extends LlmAdapter {
   }
 
   /**
-   * 取得（必要时拉起）长驻桥。登录态失效时清缓存重建一次；
-   * 其它致命错误（进程退出等）也重建。
+   * 主流程：把 DSH 的请求翻译成云端 OpenAI 形状，流式转发回 DSH。
+   *
+   * 块编号策略（与 DSH 协议一致）：
+   * - 思考块（`reasoning_content`）先出现 → 索引 0；
+   * - 正文块 → 紧随其后；
+   * - 工具调用块按 `index` 顺序依次编号；
+   * - 每个块在 `block-end` 时携带**累积完整内容**。
    */
-  private async getBridge(): Promise<LingxiBridge> {
-    if (this.bridge) return this.bridge
-    if (this.bridgePromise) return this.bridgePromise
-    this.bridgePromise = this.startBridge().finally(() => {
-      this.bridgePromise = undefined
-    })
-    try {
-      this.bridge = await this.bridgePromise
-      return this.bridge
-    } catch (error) {
-      throw error
-    }
-  }
-
-  private async startBridge(): Promise<LingxiBridge> {
-    const env = await this.ensureEnv()
-    if (!this.host) this.host = await detectLingxiHost(env)
-    const sid = await extractWpsSid(env)
-    if (this.options.bridgeFactory) return this.options.bridgeFactory(this.host, sid)
-    return LingxiBridge.start(this.host, sid)
-  }
-
-  /** 关闭并丢弃当前桥（致命错误后调用）。 */
-  private discardBridge(): void {
-    const bridge = this.bridge
-    this.bridge = undefined
-    bridge?.close()
-  }
-
-  /**
-   * 带一次「登录态失效自动重建」的桥调用。
-   * 仅对鉴权类错误重建；重建用强制刷新的 SID。
-   */
-  private async withBridge<T>(run: (bridge: LingxiBridge) => Promise<T>): Promise<T> {
-    let bridge = await this.getBridge()
-    try {
-      return await run(bridge)
-    } catch (error) {
-      if (isAuthFailure(error)) {
-        this.discardBridge()
-        const env = await this.ensureEnv()
-        await extractWpsSid(env, true)
-        bridge = await this.getBridge()
-        return await run(bridge)
-      }
-      // 进程死亡类错误：丢桥，让下一次请求重新拉起（本次失败照传）。
-      const message = (error as Error | undefined)?.message ?? ''
-      if (/意外退出|启动失败|连接不可用|桥进程/.test(message)) this.discardBridge()
-      throw error
-    }
-  }
-
   override async *stream(options: GenerateOptions): AsyncIterableIterator<StreamChunk> {
     const model = options.model || LINGXI_DEFAULT_MODEL
-    const prompt = serializeLingxiPrompt(options.messages, options.system)
+    const converted = toDirectMessages(options.messages, options.system)
+    const tools = toDirectTools(options.tools)
 
-    // 桥回调 → 异步队列；generator 单线程消费，保证 chunk 顺序。
-    const queue: QueueEvent[] = []
+    if (converted.messages.length === 0) {
+      // 没有任何可下发内容：这是调用方 bug，给出明确错误而不是发空请求。
+      throw new LlmError('灵犀请求没有可下发的消息', 'INVALID_REQUEST')
+    }
+
+    const client = await this.getClient()
+    const workspaceWin = await this.resolveWorkspaceWin(options.sessionId)
+    const sessionKey = options.sessionId ? String(options.sessionId) : 'default'
+
+    /* ---------------- 流式状态：块编号与累积内容 ---------------- */
+
+    /** 已开启的块（按 DSH 索引）。 */
+    interface OpenBlock {
+      index: number
+      type: 'reasoning' | 'text' | 'tool-call'
+      /** 累积正文（text/reasoning）。 */
+      text: string
+      /** 工具调用身份与累积参数。 */
+      callId?: string
+      name?: string
+      args?: string
+    }
+
+    const blocks: OpenBlock[] = []
+    /** 云端 tool_call index → 我们分配的块（同一调用跨帧复用）。 */
+    const callIndexToBlock = new Map<number, OpenBlock>()
+    let reasoningBlock: OpenBlock | undefined
+    let textBlock: OpenBlock | undefined
+    let nextIndex = 0
+
+    /** 开一个新块并立即产出 block-start（generator 内联，故用闭包收集）。 */
+    const opened: StreamChunk[] = []
+    const openBlock = (type: OpenBlock['type']): OpenBlock => {
+      const block: OpenBlock = { index: nextIndex++, type, text: '' }
+      blocks.push(block)
+      opened.push({ type: 'block-start', index: block.index, blockType: type })
+      return block
+    }
+
+    /* ---------------- 队列：把回调搬进 generator ---------------- */
+
+    const queue: StreamChunk[] = []
     let wake: (() => void) | undefined
-    let finished = false
+    let done = false
+    let failure: Error | undefined
     const notify = (): void => {
       const fn = wake
       wake = undefined
       fn?.()
     }
-    const push = (event: QueueEvent): void => {
-      queue.push(event)
+    /** 把已开块产生的 chunk 冲进队列。 */
+    const flushOpened = (): void => {
+      while (opened.length > 0) queue.push(opened.shift()!)
       notify()
     }
-    const waitForEvent = (): Promise<void> =>
-      new Promise((resolve) => {
-        wake = resolve
-      })
 
-    // componentId → 块索引/类型/累积文本（块按首次 start 顺序编号）。
-    const components = new Map<string, { index: number, kind: 'reasoning' | 'text', text: string }>()
-    let nextIndex = 0
+    let result: Awaited<ReturnType<LingxiDirectClient['chat']>> | undefined
 
-    let result: { textLength: number } | undefined
-    let runError: Error | undefined
-
-    // 跟随当前 DSH 会话的工作区（按 sessionId 反查 cwd），不依赖进程 cwd。
-    const workspaceWin = await this.resolveWorkspaceWin(options.sessionId)
-
-    const task = this.withBridge(async (bridge) => {
-      return bridge.runOnce({
-        prompt,
+    const task = client.chat(
+      sessionKey,
+      {
         model,
-        signal: options.signal,
-        // 让灵犀 agent 在当前 DSH 会话的工作区里读写，而不是桥的 Windows TEMP。
+        messages: converted.messages,
+        tools,
+        system: converted.system || undefined,
+        maxTokens: options.maxTokens,
+        temperature: options.temperature,
+        reasoningEffort: options.reasoningEffort ? String(options.reasoningEffort) : undefined,
+        // 建 run 时用作账单标题（积分流水里可见，便于对账）。
+        title: firstUserText(options.messages) || 'DSH 会话',
         workspaceWin,
-        listener: {
-          onBlockStart: (componentId, kind) => {
-            const index = nextIndex++
-            components.set(componentId, { index, kind, text: '' })
-            push({ kind: 'start', componentId, blockKind: kind, index })
-          },
-          onDelta: (componentId, kind, delta) => {
-            const component = components.get(componentId)
-            if (!component) return
-            component.text += delta
-            push({ kind: 'delta', index: component.index, blockKind: kind, text: delta })
-          },
+        signal: options.signal,
+      },
+      {
+        onReasoning(delta) {
+          if (!reasoningBlock) {
+            reasoningBlock = openBlock('reasoning')
+            flushOpened()
+          }
+          reasoningBlock.text += delta
+          queue.push({ type: 'reasoning-delta', index: reasoningBlock.index, text: delta })
+          notify()
         },
-      })
-    }).then((res) => {
-      result = { textLength: res.text.length }
+        onText(delta) {
+          if (!textBlock) {
+            textBlock = openBlock('text')
+            flushOpened()
+          }
+          textBlock.text += delta
+          queue.push({ type: 'text-delta', index: textBlock.index, text: delta })
+          notify()
+        },
+        onToolCallDelta(callIndex, id, name, argsDelta) {
+          let block = callIndexToBlock.get(callIndex)
+          if (!block) {
+            block = openBlock('tool-call')
+            block.callId = id
+            block.name = name
+            block.args = ''
+            callIndexToBlock.set(callIndex, block)
+            flushOpened()
+            // 首帧必须发一次带 id/name 的 delta，DSH 据此建立调用身份。
+            queue.push({
+              type: 'tool-call-delta',
+              index: block.index,
+              id: ToolCallId(block.callId ?? `call_${callIndex}`),
+              name: block.name,
+              argumentsDelta: '',
+            })
+            notify()
+          } else {
+            if (id) block.callId = id
+            if (name) block.name = name
+          }
+          if (argsDelta) {
+            block.args = (block.args ?? '') + argsDelta
+            queue.push({
+              type: 'tool-call-delta',
+              index: block.index,
+              id: ToolCallId(block.callId ?? `call_${callIndex}`),
+              argumentsDelta: argsDelta,
+            })
+            notify()
+          }
+        },
+      },
+    ).then((res) => {
+      result = res
     }).catch((error: unknown) => {
-      runError = error instanceof Error ? error : new Error(String(error))
+      failure = error instanceof Error ? error : new Error(String(error))
     }).finally(() => {
-      finished = true
+      done = true
       notify()
     })
 
     options.signal?.addEventListener('abort', () => {
-      finished = true
+      done = true
       notify()
     }, { once: true })
 
-    // 排空队列直到 run 结束。
-    while (!finished || queue.length > 0) {
+    /* ---------------- 排空队列 ---------------- */
+
+    while (!done || queue.length > 0) {
       if (queue.length === 0) {
-        await waitForEvent()
+        await new Promise<void>((resolve) => {
+          wake = resolve
+        })
         continue
       }
-      const event = queue.shift()!
-      if (event.kind === 'start') {
-        yield {
-          type: 'block-start',
-          index: event.index,
-          blockType: event.blockKind === 'reasoning' ? 'reasoning' : 'text',
-        }
-      } else if (event.kind === 'delta') {
-        if (event.blockKind === 'reasoning') {
-          yield { type: 'reasoning-delta', index: event.index, text: event.text }
-        } else {
-          yield { type: 'text-delta', index: event.index, text: event.text }
-        }
-      } else if (event.kind === 'error') {
-        throw event.error
-      }
+      yield queue.shift()!
     }
 
     await task
 
-    // abort：产出 aborted finish（不抛，遵循 StreamChunk 收尾约定）。
     if (options.signal?.aborted) {
       yield {
         type: 'finish',
@@ -388,37 +402,94 @@ export class LingxiAdapter extends LlmAdapter {
       }
       return
     }
-    if (runError) throw runError
+    if (failure) throw failure
+    if (!result) throw new LlmError('灵犀对话未返回结果', 'EMPTY_RESPONSE')
 
-    // 按块索引顺序补 block-end（携带累积完整块）。
-    const ordered = [...components.values()].sort((a, b) => a.index - b.index)
-    for (const component of ordered) {
-      yield {
-        type: 'block-end',
-        index: component.index,
-        block: component.kind === 'reasoning'
-          ? { type: 'reasoning', text: component.text }
-          : { type: 'text', text: component.text },
+    /* ---------------- 补 block-end（携带累积完整内容） ---------------- */
+
+    for (const block of blocks) {
+      let content: ContentBlock
+      if (block.type === 'reasoning') {
+        content = { type: 'reasoning', text: block.text }
+      } else if (block.type === 'text') {
+        content = { type: 'text', text: block.text }
+      } else {
+        content = {
+          type: 'tool-call',
+          id: ToolCallId(block.callId ?? `call_${block.index}`),
+          name: block.name ?? '',
+          arguments: block.args ?? '',
+        }
       }
+      yield { type: 'block-end', index: block.index, block: content }
     }
 
-    if (!result || result.textLength === 0) {
-      // 空响应：规范错误码，运行时按 EMPTY_RESPONSE 处理（可安全重试），
-      // 与 openai-compat.ts 的空响应口径一致。
-      throw new LlmError('灵犀模型未返回任何正文内容', 'EMPTY_RESPONSE')
+    /* ---------------- usage ---------------- */
+
+    const usage = toTokenUsage(result.usage)
+    if (usage) yield { type: 'usage', usage }
+
+    /* ---------------- finish ---------------- */
+
+    // 空响应（既无正文也无工具调用）：规范成 EMPTY_RESPONSE，运行时可安全重试。
+    if (result.toolCalls.length === 0 && result.text.trim().length === 0) {
+      throw new LlmError('灵犀模型未返回任何内容', 'EMPTY_RESPONSE')
     }
 
-    // 灵犀不下发 token 计数，故不产出 usage 块（避免用假数字污染计量）。
-    yield { type: 'finish', reason: { kind: 'stop' } }
+    yield {
+      type: 'finish',
+      reason: result.toolCalls.length > 0
+        ? { kind: 'tool-calls' }
+        : result.finishReason === 'length'
+          ? { kind: 'max-tokens' }
+          : { kind: 'stop' },
+    }
   }
+}
+
+/**
+ * 云端 usage → DSH `TokenUsage`。
+ *
+ * ⚠️ 口径差异：DSH 的计数是**互斥**的（`inputTokens` 只算未命中缓存的输入，
+ * 缓存命中单列 `cacheReadTokens`），而灵犀的 `prompt_tokens` 是**含缓存**的
+ * 总数（真机实测 `cached_tokens` 是其子集）。故必须相减，否则计量翻倍。
+ */
+function toTokenUsage(raw: { promptTokens: number; completionTokens: number; totalTokens: number; cachedTokens: number } | undefined): TokenUsage | undefined {
+  if (!raw) return undefined
+  const cached = Math.max(0, raw.cachedTokens)
+  const input = Math.max(0, raw.promptTokens - cached)
+  return {
+    inputTokens: input,
+    outputTokens: raw.completionTokens,
+    totalTokens: raw.totalTokens || input + cached + raw.completionTokens,
+    ...(cached > 0 ? { cacheReadTokens: cached } : {}),
+  }
+}
+
+/** 取首条用户消息的纯文本（用作积分流水里的任务名）。 */
+function firstUserText(messages: GenerateOptions['messages']): string {
+  for (const message of messages) {
+    if ((message as { role?: string }).role !== 'user') continue
+    const content = (message as { content?: unknown }).content
+    if (typeof content === 'string') return content
+    if (Array.isArray(content)) {
+      const text = content
+        .map((raw) => (typeof raw === 'string' ? raw : (raw as { text?: string }).text ?? ''))
+        .join('')
+      if (text.trim()) return text
+    }
+  }
+  return ''
 }
 
 /**
  * 注册灵犀 provider 路由。
  *
- * 仅当①运行在 WSL、②能探测到桌面 App、③能取到登录 SID 时才注册；
- * 任一不满足都静默跳过（非 WSL / 未装桌面版 / 未登录的用户不应看到一个一用就报错的模型）。
- * 探测是异步且宽松的：失败只记日志、不影响插件其它 provider。
+ * 仅当①运行在 WSL、②能取到桌面登录态 SID 时才注册；任一不满足都静默跳过
+ * （非 WSL / 未登录的用户不应看到一个一用就报错的模型）。
+ *
+ * 注意：v2.0 不再探测 `lingxi.exe`——直连云端只需要 SID，桌面版是否在运行
+ * 都无所谓（只要曾经登录过，cookie 就在）。
  */
 export async function registerLingxiLlm(ctx: Context): Promise<LingxiAdapter | undefined> {
   let env: WslEnvironment
@@ -431,13 +502,12 @@ export async function registerLingxiLlm(ctx: Context): Promise<LingxiAdapter | u
   }
   let adapter: LingxiAdapter
   try {
-    // 提前探测宿主 + 登录态，避免注册出一个无法工作的路由。
-    const host = await detectLingxiHost(env)
+    // 提前验证登录态可提取，避免注册出一个无法工作的路由。
     await extractWpsSid(env)
 
     // 按会话 id 反查该会话的项目工作目录（WSL 路径）。
     // sessionQuery 由插件 inject 声明；observeSession 返回的租约带 [Symbol.dispose]，
-    // 只读 header.cwd 后立即释放。失败/拿不到都返回 undefined（回退临时工作区）。
+    // 只读 header.cwd 后立即释放。失败/拿不到都返回 undefined。
     const sessionQuery = (ctx as unknown as { sessionQuery?: LingxiSessionQueryLike }).sessionQuery
     const resolveSessionCwd = sessionQuery
       ? async (sessionId: string): Promise<string | undefined> => {
@@ -451,15 +521,16 @@ export async function registerLingxiLlm(ctx: Context): Promise<LingxiAdapter | u
       : undefined
 
     adapter = new LingxiAdapter({ env, resolveSessionCwd })
-    // 缓存探测结果，省去首次请求的重复探测。
-    adapter.primeHost(host)
   } catch (error) {
     ctx.logger?.warn?.(
-      `[lingxi] 未启用 WPS 灵犀桌面 provider：${(error as Error).message}`,
+      `[lingxi] 未启用 WPS 灵犀 provider：${(error as Error).message}`,
     )
     return undefined
   }
   registerAdapterIdempotent(ctx.llm, [LINGXI.id], adapter)
-  ctx.logger?.info?.(`[lingxi] 已注册 provider "${LINGXI.id}"（WPS 灵犀桌面版）`)
+  ctx.logger?.info?.(`[lingxi] 已注册 provider "${LINGXI.id}"（WPS 灵犀云端直连，支持工具调用）`)
   return adapter
 }
+
+/** 供测试/诊断：导出内部类型。 */
+export type { DirectToolCall }

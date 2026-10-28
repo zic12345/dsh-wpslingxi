@@ -1,7 +1,7 @@
 {
   "name": "dsh-wpslingxi",
-  "version": "1.1.0",
-  "description": "在 WSL 下把 Windows 宿主的 WPS 灵犀桌面版接入 DSH：灵犀模型路由 + 每日签到领智点 + 智点余额面板",
+  "version": "2.0.0",
+  "description": "把 WPS 灵犀接入 DSH：直连灵犀云端 LLM（原生工具调用，DSH 主导 agent 循环）+ 每日签到领智点 + 智点余额面板",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -20,8 +20,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "build:client": "node plugin-src/client/build.mjs",
-    "build:assets": "node scripts/copy-assets.mjs",
-    "build:all": "pnpm build && pnpm build:assets && pnpm build:client",
+    "build:all": "pnpm build && pnpm build:client",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dsh": {

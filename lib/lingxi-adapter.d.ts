@@ -1,63 +1,69 @@
 /**
- * WPS 灵犀（桌面版）DSH 适配器。
+ * WPS 灵犀 DSH 适配器（v2.0：直连云端，DSH 主导 agent 循环）。
  *
- * 与本插件其它 provider 不同，灵犀**没有云端 OpenAI 兼容端点、没有 API Key、
- * 也没有可在设置页填写的 baseURL**——模型能力只经桌面 App 自带的
- * `lingxi.exe`（app-server）以 stdio JSON-RPC 暴露。在 WSL 里还要跨过
- * 两层 interop（WSL Node → 灵犀 portable node.exe → boot.cjs → lingxi.exe），
- * 详见 {@link LingxiBridge} 与 src/lingxi-assets/boot.cjs 的头部注释。
+ * ## 与 v1.x 的根本差异
  *
- * 因此本适配器：
- * - **不进** provider-registry / provider-runtime / Jet Hub 账号池（无登录 UI、
- *   无 HTTP 限流、无余额面板），只在成功探测到 WSL + 桌面登录态时注册 `ctx.llm` 路由；
- * - 凭据（wps_sid）由 {@link extractWpsSid} 自动从桌面 App 的登录 cookie 提取，
- *   也允许 `DSH_LINGXI_WPS_SID` 覆盖；
- * - 每次 `stream()` 是一次**无状态**对话：把 messages 渲染成单条 prompt，
- *   新建 session + run，实时消费 component 事件产出 StreamChunk。
- * - 灵犀无原生 function-calling，工具调用/结果降级为转录文本（见 lingxi-messages.ts）。
+ * v1.x 把对话交给桌面 `lingxi.exe`（app-server），模型跑在**灵犀自己的
+ * agent 循环**里：工具是灵犀沙箱内的 bash/file/web，DSH 的工具链完全用不上，
+ * 宿主 PowerShell 还被灵犀的双层黑名单拦住（Python 审计层 + Go 词法层）。
+ *
+ * v2.0 直接调云端 `POST /api/public/v1/agent-runtime/chat/completions`
+ * （OpenAI 风格，支持 `tools`/`tool_calls`），**agent 循环交回 DSH**：
+ *
+ * - 工具：`options.tools` 原样下发，模型返回的 `tool_calls` 转成 DSH 的
+ *   `tool-call` 块，DSH 执行完再用 `role:'tool'` 回传 → 宿主 PowerShell、
+ *   WSL bash、DSH 全部内置工具立即可用；
+ * - 系统提示词：走灵犀的 `context` 字段（真机抓包确认可整体覆盖其内置提示词）；
+ * - 上下文/压缩/重试/审批：全部由 DSH 负责，灵犀只当一个纯 LLM 后端。
+ *
+ * 详见 {@link LingxiDirectClient}（HTTP 客户端）与 lingxi-messages.ts（消息转换）。
+ *
+ * ## 仍然保留的能力
+ *
+ * - 凭据：`wps_sid` 由 {@link extractWpsSid} 从桌面 App 登录态自动提取
+ *   （DPAPI + AES-256-GCM 解 Chromium cookie），也允许 `DSH_LINGXI_WPS_SID` 覆盖；
+ * - 计费：按 run 计（一个 DSH 会话 1 智点），见 {@link LingxiDirectClient}；
+ * - 设置页的签到/智点面板：与 LLM 通道共用同一个 SID，互不影响。
  */
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm';
 import type { Context } from '@deepseek-ai/cordis';
 import { type WslEnvironment } from './lingxi-win32.js';
-import { LingxiBridge, type LingxiHost } from './lingxi-bridge.js';
+import { type DirectToolCall } from './lingxi-direct.js';
 /** 适配器构造参数。 */
 export interface LingxiAdapterOptions {
     /** 强制注入 WSL 环境（测试用）；缺省时运行时探测。 */
     env?: WslEnvironment;
-    /** 强制注入桥工厂（测试用）。 */
-    bridgeFactory?: (host: LingxiHost, sid: string) => Promise<LingxiBridge>;
     /**
      * 按 DSH 会话 id 解析该会话的项目工作目录（**WSL 路径**）。
      *
      * 由 index.ts 用宿主 `ctx.sessionQuery.observeSession(sessionId).header.cwd`
-     * 实现并注入：LLM 的 GenerateOptions 不携带工作区，只携带 sessionId，
-     * 每个会话的 cwd 必须这样反查，才能做到「跟随当前会话工作区」。
+     * 实现并注入：LLM 的 GenerateOptions 不携带工作区，只携带 sessionId。
+     * v2.0 里该路径只用于在云端会话上**声明**工作区（不影响工具执行，
+     * 工具跑在 DSH 侧的真实 cwd 里）。
      */
     resolveSessionCwd?: (sessionId: string) => Promise<string | undefined>;
 }
 export declare class LingxiAdapter extends LlmAdapter {
     private readonly options;
     private env;
-    private host;
-    private bridge;
-    /** 单飞的建桥 Promise，避免并发请求重复拉起进程。 */
-    private bridgePromise;
+    /** 直连客户端（进程级单例，内部按 sessionId 缓存 run）。 */
+    private client;
     /** 远端刷新过的模型目录（未刷新前用内置兜底目录）。 */
     private remoteModels;
     /**
-     * 每个 DSH 会话解析出的灵犀工作目录（Windows 路径），按 sessionId 缓存。
+     * 每个 DSH 会话解析出的工作区（Windows 路径），按 sessionId 缓存。
      * 会话 cwd 固定，只反查一次；wslpath 转换同样缓存（按 WSL 路径）。
      */
     private readonly sessionWorkspace;
     private readonly wslToWinCache;
     constructor(options?: LingxiAdapterOptions);
-    /** 注册阶段已探测过宿主时注入，省去首次请求的重复 interop 探测。 */
-    primeHost(host: LingxiHost): void;
     providerInfo(_provider: string): LlmProviderInfo;
     /**
-     * 对外可展示的模型：默认直接返回内置目录（GUI 不能被一次昂贵的 interop
-     * 建桥拖住）。后台不主动刷新——首次真实对话建桥后目录已可用，下次列表即更新。
+     * 对外可展示的模型：直接返回内置目录。
+     *
+     * 云端 `model/list` 已不再需要（直连时模型名就是请求字段，网关按名路由），
+     * 故列表纯本地、零延迟。
      */
     listModels(_provider: string): Promise<readonly LlmModelInfo[]>;
     resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo>;
@@ -66,39 +72,45 @@ export declare class LingxiAdapter extends LlmAdapter {
     /** 懒探测 WSL 环境（非 WSL 直接抛错，注册阶段已拦截，这里双保险）。 */
     private ensureEnv;
     /**
-     * 解析本次 LLM 请求应交给灵犀 agent 的工作目录（Windows 路径），**跟随会话**。
+     * 取直连客户端（单例）。SID 在首次真正请求时才提取，避免注册阶段
+     * 拖慢启动；401 由客户端内部强制重取。
+     */
+    private getClient;
+    /**
+     * 解析本次请求应声明给云端的会话工作区（Windows 路径）。
      *
      * 优先级：
      * 1. 环境变量 DSH_LINGXI_WORKSPACE（显式覆盖，全局固定）；
      * 2. 当前 DSH 会话的项目目录——用 GenerateOptions.sessionId 经注入的
      *    resolveSessionCwd 反查 `sessionQuery.observeSession(...).header.cwd`；
-     * 3. 都拿不到时返回 undefined，由桥回退到它自己的临时工作区。
+     * 3. 都拿不到时返回 undefined（云端回退到它的默认临时目录）。
      *
-     * 每个 sessionId 只反查/转换一次（会话 cwd 固定）。
+     * ⚠️ 只用于云端会话的 `work_space_dir` 声明，**不决定工具执行目录**：
+     * v2.0 的工具全在 DSH 侧执行，天然跟随会话 cwd。
      */
     private resolveWorkspaceWin;
     /** WSL→Windows 路径转换，按 WSL 路径缓存结果。 */
     private toWindowsCached;
     /**
-     * 取得（必要时拉起）长驻桥。登录态失效时清缓存重建一次；
-     * 其它致命错误（进程退出等）也重建。
+     * 主流程：把 DSH 的请求翻译成云端 OpenAI 形状，流式转发回 DSH。
+     *
+     * 块编号策略（与 DSH 协议一致）：
+     * - 思考块（`reasoning_content`）先出现 → 索引 0；
+     * - 正文块 → 紧随其后；
+     * - 工具调用块按 `index` 顺序依次编号；
+     * - 每个块在 `block-end` 时携带**累积完整内容**。
      */
-    private getBridge;
-    private startBridge;
-    /** 关闭并丢弃当前桥（致命错误后调用）。 */
-    private discardBridge;
-    /**
-     * 带一次「登录态失效自动重建」的桥调用。
-     * 仅对鉴权类错误重建；重建用强制刷新的 SID。
-     */
-    private withBridge;
     stream(options: GenerateOptions): AsyncIterableIterator<StreamChunk>;
 }
 /**
  * 注册灵犀 provider 路由。
  *
- * 仅当①运行在 WSL、②能探测到桌面 App、③能取到登录 SID 时才注册；
- * 任一不满足都静默跳过（非 WSL / 未装桌面版 / 未登录的用户不应看到一个一用就报错的模型）。
- * 探测是异步且宽松的：失败只记日志、不影响插件其它 provider。
+ * 仅当①运行在 WSL、②能取到桌面登录态 SID 时才注册；任一不满足都静默跳过
+ * （非 WSL / 未登录的用户不应看到一个一用就报错的模型）。
+ *
+ * 注意：v2.0 不再探测 `lingxi.exe`——直连云端只需要 SID，桌面版是否在运行
+ * 都无所谓（只要曾经登录过，cookie 就在）。
  */
 export declare function registerLingxiLlm(ctx: Context): Promise<LingxiAdapter | undefined>;
+/** 供测试/诊断：导出内部类型。 */
+export type { DirectToolCall };
