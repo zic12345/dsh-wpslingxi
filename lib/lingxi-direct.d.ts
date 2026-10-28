@@ -82,6 +82,8 @@ export declare class LingxiDirectClient {
     private readonly runs;
     /** sessionId → 正在创建中的 Promise（避免并发首请求重复建 run）。 */
     private readonly pendingRuns;
+    /** sessionId → 串行锁链尾（同一 run 内的对话请求必须排队，见 withRunLock）。 */
+    private readonly runLocks;
     constructor(
     /** 取当前 SID；force=true 时强制重新从桌面登录态提取。 */
     resolveSid: (force?: boolean) => Promise<string>, 
@@ -142,6 +144,22 @@ export declare class LingxiDirectClient {
         workspaceWin?: string;
         signal?: AbortSignal;
     }, listener?: DirectStreamListener): Promise<DirectChatResult>;
+    /**
+     * 在持有该会话的 run 锁时执行一次对话。
+     *
+     * 内含两类可恢复错误的重试：
+     * - 登录态失效（401）：强制重新提取 SID，再重发（run 仍有效）；
+     * - run 失效（SQLNoRows / 数据不存在）：丢缓存重建 run 后重发。
+     */
+    private runChat;
+    /**
+     * 以「按 sessionId 串行」的方式执行一段异步逻辑。
+     *
+     * 实现是每个 sessionId 维护一条 Promise 链尾：新任务接在链尾，
+     * 前一个任务结束（无论成功失败）后才开始下一个。相比引入信号量，
+     * 这样能保证严格的**先来先服务**，且不需要额外的清理逻辑。
+     */
+    private withRunLock;
     /** 真正发流式请求并解析 SSE。 */
     private streamChat;
     /** 清理所有缓存的 run（进程退出/插件卸载时用）。 */

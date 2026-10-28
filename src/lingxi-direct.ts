@@ -162,6 +162,8 @@ export class LingxiDirectClient {
   private readonly runs = new Map<string, RunContext>()
   /** sessionId → 正在创建中的 Promise（避免并发首请求重复建 run）。 */
   private readonly pendingRuns = new Map<string, Promise<RunContext>>()
+  /** sessionId → 串行锁链尾（同一 run 内的对话请求必须排队，见 withRunLock）。 */
+  private readonly runLocks = new Map<string, Promise<void>>()
 
   constructor(
     /** 取当前 SID；force=true 时强制重新从桌面登录态提取。 */
@@ -358,9 +360,48 @@ export class LingxiDirectClient {
     // ① + ②：取 run（首次会建会话与 run）。
     let context = await this.ensureRun(dshSessionId, request.model, title, request.workspaceWin)
 
-    // ③：流式请求；两类可恢复错误各重试一次：
-    //   - 登录态失效（401）：强制重新提取 SID，再重发（run 仍有效）；
-    //   - run 失效（SQLNoRows / 数据不存在）：丢缓存重建 run。
+    /*
+     * 同一 run 内的对话请求必须**串行**。
+     *
+     * 云端按 run 维护一份服务端状态，同一 run 上并发两个 chat/completions
+     * 会互相踩状态（真机复现：会话标题生成与正文请求同时发起时，正文请求
+     * 稳定返回 HTTP 200 + `{"code":"AIError","message":"AI服务异常"}`，
+     * 单发或串行则 100% 正常）。
+     *
+     * 这里不加锁会直接影响真实使用：DSH 在会话开头会并发发起「生成标题」
+     * 与「正文」两个 purpose 的请求，两者共用一个 run，于是正文必挂。
+     */
+    return await this.withRunLock(dshSessionId, () =>
+      this.runChat(context, dshSessionId, request, listener),
+    )
+  }
+
+  /**
+   * 在持有该会话的 run 锁时执行一次对话。
+   *
+   * 内含两类可恢复错误的重试：
+   * - 登录态失效（401）：强制重新提取 SID，再重发（run 仍有效）；
+   * - run 失效（SQLNoRows / 数据不存在）：丢缓存重建 run 后重发。
+   */
+  private async runChat(
+    initialContext: RunContext,
+    dshSessionId: string,
+    request: {
+      model: string
+      messages: DirectChatMessage[]
+      tools?: DirectToolSchema[]
+      system?: string
+      maxTokens?: number
+      temperature?: number
+      reasoningEffort?: string
+      title?: string
+      workspaceWin?: string
+      signal?: AbortSignal
+    },
+    listener: DirectStreamListener,
+  ): Promise<DirectChatResult> {
+    let context = initialContext
+    const title = request.title?.slice(0, 100) || 'DSH 会话'
     try {
       return await this.streamChat(context, request, listener)
     } catch (error) {
@@ -374,6 +415,35 @@ export class LingxiDirectClient {
       this.dropRun(dshSessionId)
       context = await this.ensureRun(dshSessionId, request.model, title, request.workspaceWin)
       return await this.streamChat(context, request, listener)
+    }
+  }
+
+  /**
+   * 以「按 sessionId 串行」的方式执行一段异步逻辑。
+   *
+   * 实现是每个 sessionId 维护一条 Promise 链尾：新任务接在链尾，
+   * 前一个任务结束（无论成功失败）后才开始下一个。相比引入信号量，
+   * 这样能保证严格的**先来先服务**，且不需要额外的清理逻辑。
+   */
+  private async withRunLock<T>(dshSessionId: string, task: () => Promise<T>): Promise<T> {
+    const previous = this.runLocks.get(dshSessionId) ?? Promise.resolve()
+    // 链尾只关心「前一个任务已结束」，不关心其结果，故吞掉异常。
+    const gate = previous.then(
+      () => undefined,
+      () => undefined,
+    )
+    const current = gate.then(task)
+    // 记录本次的链尾（同样吞掉异常，避免未处理的 rejection 警告）。
+    const tail: Promise<void> = current.then(
+      () => undefined,
+      () => undefined,
+    )
+    this.runLocks.set(dshSessionId, tail)
+    try {
+      return await current
+    } finally {
+      // 本任务结束后若链尾仍指向自己则清除，避免 Map 无限增长。
+      if (this.runLocks.get(dshSessionId) === tail) this.runLocks.delete(dshSessionId)
     }
   }
 
@@ -450,6 +520,7 @@ export class LingxiDirectClient {
   clear(): void {
     this.runs.clear()
     this.pendingRuns.clear()
+    this.runLocks.clear()
   }
 }
 
