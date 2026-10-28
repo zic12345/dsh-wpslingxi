@@ -92,12 +92,17 @@ cordis.patch.yml          作为 profile bundle 装载时向配置树插入插�
 
 ```bash
 cd dsh-wpslingxi
-pnpm install        # 若 esbuild 构建脚本被忽略：pnpm approve-builds
+pnpm install                       # 构建脚本授权见下方 pnpm-workspace.yaml 说明
 rm -rf lib && pnpm run build:all   # = tsc + esbuild(client/panel.js)
 ```
 
-> 注意要写 `pnpm run build:all`：仓库没有 workspace 文件时，`pnpm build:all`
-> 会被当成递归 exec 而报 `ERR_PNPM_RECURSIVE_EXEC_FIRST_FAIL`。
+> 仓库根的 `pnpm-workspace.yaml` 只为声明 `allowBuilds: { esbuild: true }`：
+> pnpm 12 把该授权从 `package.json` 移到了这个文件，不声明就每次 install 报
+> `ERR_PNPM_IGNORED_BUILDS: Ignored build scripts: esbuild@0.24.2`。它不含
+> `packages:` 字段，因此不会把本仓库变成 monorepo。
+>
+> 习惯上仍建议写 `pnpm run build:all`：若把该文件删掉，`pnpm build:all` 会被
+> 当成递归 exec 而报 `ERR_PNPM_RECURSIVE_EXEC_FIRST_FAIL`。
 
 ## 安装到 DSH（web profile）
 
