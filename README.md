@@ -152,7 +152,8 @@ dsh plugin --profile web remove dsh-wpslingxi
 | 模型列表为空 / 无 `lingxi` provider | 不在 WSL、或从未登录过桌面版；查看 DSH 日志里 `[lingxi]` 警告 |
 | 模型报网络异常 | 确认 WSL 能访问 `https://lingxi.wps.cn`（默认无需宿主代理） |
 | 对话报「数据不存在 / SQLNoRows」 | 云端 run 过期，客户端会自动重建并重试一次 |
-| 对话立刻报「AI服务异常」（`code: UNKNOWN`，无细节） | 工具参数 schema 里有云端不接受的结构（缺 `type` 的组合子/节点、联合类型数组）。v2.0.1 已在 `toDirectTools` 里自动清洗，若仍出现请查 DSH 版本新增的工具 |
+| 对话立刻报「AI服务异常」（`code: UNKNOWN`，无细节） | 两个已修根因：①工具参数 schema 里有云端不接受的结构（缺 `type` 的组合子/节点、联合类型数组），v2.0.1 已在 `toDirectTools` 里自动清洗，若仍出现请查 DSH 版本新增的工具；②**同一 run 内并发请求**（DSH 会话开头会并发发起标题生成与正文），v2.0.2 已用 `withRunLock` 按会话串行化 |
+| 会话第一条消息必失败、重发一次又正常 | 同上第 ② 条：v2.0.2 之前在同一 run 上并发两个 `chat/completions` 会踩云端状态，升级到 v2.0.2 即可 |
 | 回复为空但用了智点 | `max_tokens` 太小，预算被思考内容吃光；DSH 侧调大 maxTokens |
 | PowerShell 输出中文乱码导致路径损坏 | 已在生成的脚本里强制 `[Console]::OutputEncoding=UTF8`（PS 5.1 默认 GBK） |
 
