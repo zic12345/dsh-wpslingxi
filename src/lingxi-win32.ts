@@ -24,6 +24,32 @@ const POWERSHELL_CANDIDATES = [
 export interface WslEnvironment {
   /** powershell.exe 的 WSL 路径。 */
   readonly powershell: string
+  /**
+   * 是否必须经 `/init` 转发才能执行 Windows 程序（interop 注册缺失时为 true）。
+   *
+   * 省略/false 表示内核 binfmt 正常工作，可直接 execFile 一个 `.exe`。
+   */
+  readonly useInit?: boolean
+}
+
+/**
+ * WSL interop 是否由 binfmt_misc 注册。
+ *
+ * 正常时 `/proc/sys/fs/binfmt_misc/WSLInterop` 存在，Linux 内核直接把 `.exe`
+ * 交给 Windows 执行。该条目**可能丢失**（实测 2026-10-30：条目消失后任何
+ * Windows exe 都报 `cannot execute binary file: Exec format error`，而
+ * `/init` 依旧可执行）。此时必须改用 `/init <win-exe> <args...>` 启动。
+ */
+function hasInteropRegistration(): boolean {
+  for (const name of ['WSLInterop', 'WSLInterop-late']) {
+    if (existsSync(`/proc/sys/fs/binfmt_misc/${name}`)) return true
+  }
+  return false
+}
+
+/** `/init` 是否存在（WSL 的 init 二进制，interop 失效时唯一可用入口）。 */
+function hasWslInit(): boolean {
+  return existsSync('/init')
 }
 
 /**
@@ -32,6 +58,9 @@ export interface WslEnvironment {
  * 2. `/mnt/c` 下的 Windows PowerShell 可执行。
  *
  * 两项都过才返回，避免在普通 Linux 上白跑一堆跨系统调用。
+ *
+ * 同时探测 interop 是否可用：binfmt 注册缺失但 `/init` 还在时，返回
+ * `useInit: true`，调用方改走 `/init` 转发（见 {@link runPowerShell}）。
  */
 export function detectWsl(): WslEnvironment | undefined {
   try {
@@ -42,7 +71,10 @@ export function detectWsl(): WslEnvironment | undefined {
   }
   const powershell = POWERSHELL_CANDIDATES.find((candidate) => existsSync(candidate))
   if (!powershell) return undefined
-  return { powershell }
+  // binfmt 注册在、或 /init 在，都还有救；两者都没有才是真的用不了。
+  const useInit = !hasInteropRegistration() && hasWslInit()
+  if (!hasInteropRegistration() && !useInit) return undefined
+  return useInit ? { powershell, useInit: true } : { powershell }
 }
 
 export interface PowerShellResult {
@@ -65,6 +97,14 @@ export interface PowerShellResult {
  * - 用 `-NoProfile` 避开用户 profile 的输出污染；cwd 钉到
  *   `/mnt/c/Windows/System32`（实测工作目录是 UNC 路径 `\\wsl$\...`
  *   时会有告警但不影响执行）。
+ *
+ * ⚠️ **interop 可能整体失效**：2026-10-30 实测本机
+ * `/proc/sys/fs/binfmt_misc/` 下的 `WSLInterop` 条目消失（只剩
+ * `register`/`status`），此后直接 execFile 任何 `.exe` 都报
+ * `cannot execute binary file: Exec format error`，而 `/init` 仍可执行。
+ * 故当 {@link WslEnvironment.useInit} 为真时改走
+ * `/init <powershell.exe> <args...>`——实测 UTF-8、中文、`-File`、cwd
+ * 与直连完全等价。恢复 binfmt 注册需要 root，插件不自动修。
  */
 export async function runPowerShell(
   env: WslEnvironment,
@@ -83,17 +123,17 @@ export async function runPowerShell(
 $OutputEncoding = [System.Text.Encoding]::UTF8
 `
   writeFileSync(wslPath, `﻿${encodingPrelude}${script}`, 'utf8')
+  const args = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', winPath]
+  // interop 注册缺失时改经 `/init` 转发：参数形态是 `/init <exe> <args...>`。
+  const file = env.useInit ? '/init' : env.powershell
+  const argv = env.useInit ? [env.powershell, ...args] : args
   try {
-    return await execFileAsync(
-      env.powershell,
-      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', winPath],
-      {
-        cwd: '/mnt/c/Windows/System32',
-        timeout: timeoutMs,
-        maxBuffer: 32 * 1024 * 1024,
-        windowsHide: true,
-      },
-    )
+    return await execFileAsync(file, argv, {
+      cwd: '/mnt/c/Windows/System32',
+      timeout: timeoutMs,
+      maxBuffer: 32 * 1024 * 1024,
+      windowsHide: true,
+    })
   } finally {
     rmSync(wslPath, { force: true })
   }

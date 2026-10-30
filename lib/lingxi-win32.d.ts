@@ -1,6 +1,12 @@
 export interface WslEnvironment {
     /** powershell.exe 的 WSL 路径。 */
     readonly powershell: string;
+    /**
+     * 是否必须经 `/init` 转发才能执行 Windows 程序（interop 注册缺失时为 true）。
+     *
+     * 省略/false 表示内核 binfmt 正常工作，可直接 execFile 一个 `.exe`。
+     */
+    readonly useInit?: boolean;
 }
 /**
  * 探测 WSL 环境：必须同时满足
@@ -8,6 +14,9 @@ export interface WslEnvironment {
  * 2. `/mnt/c` 下的 Windows PowerShell 可执行。
  *
  * 两项都过才返回，避免在普通 Linux 上白跑一堆跨系统调用。
+ *
+ * 同时探测 interop 是否可用：binfmt 注册缺失但 `/init` 还在时，返回
+ * `useInit: true`，调用方改走 `/init` 转发（见 {@link runPowerShell}）。
  */
 export declare function detectWsl(): WslEnvironment | undefined;
 export interface PowerShellResult {
@@ -29,6 +38,14 @@ export interface PowerShellResult {
  * - 用 `-NoProfile` 避开用户 profile 的输出污染；cwd 钉到
  *   `/mnt/c/Windows/System32`（实测工作目录是 UNC 路径 `\\wsl$\...`
  *   时会有告警但不影响执行）。
+ *
+ * ⚠️ **interop 可能整体失效**：2026-10-30 实测本机
+ * `/proc/sys/fs/binfmt_misc/` 下的 `WSLInterop` 条目消失（只剩
+ * `register`/`status`），此后直接 execFile 任何 `.exe` 都报
+ * `cannot execute binary file: Exec format error`，而 `/init` 仍可执行。
+ * 故当 {@link WslEnvironment.useInit} 为真时改走
+ * `/init <powershell.exe> <args...>`——实测 UTF-8、中文、`-File`、cwd
+ * 与直连完全等价。恢复 binfmt 注册需要 root，插件不自动修。
  */
 export declare function runPowerShell(env: WslEnvironment, script: string, timeoutMs?: number): Promise<PowerShellResult>;
 /**

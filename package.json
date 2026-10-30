@@ -1,6 +1,6 @@
 {
   "name": "dsh-wpslingxi",
-  "version": "2.0.2",
+  "version": "2.0.3",
   "description": "把 WPS 灵犀接入 DSH：直连灵犀云端 LLM（原生工具调用，DSH 主导 agent 循环）+ 每日签到领智点 + 智点余额面板",
   "type": "module",
   "main": "lib/index.js",
