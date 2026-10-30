@@ -155,7 +155,9 @@ dsh plugin --profile web remove dsh-wpslingxi
 | 对话立刻报「AI服务异常」（`code: UNKNOWN`，无细节） | 两个已修根因：①工具参数 schema 里有云端不接受的结构（缺 `type` 的组合子/节点、联合类型数组），v2.0.1 已在 `toDirectTools` 里自动清洗，若仍出现请查 DSH 版本新增的工具；②**同一 run 内并发请求**（DSH 会话开头会并发发起标题生成与正文），v2.0.2 已用 `withRunLock` 按会话串行化 |
 | 会话第一条消息必失败、重发一次又正常 | 同上第 ② 条：v2.0.2 之前在同一 run 上并发两个 `chat/completions` 会踩云端状态，升级到 v2.0.2 即可 |
 | 回复为空但用了智点 | `max_tokens` 太小，预算被思考内容吃光；DSH 侧调大 maxTokens |
+| 缓存命中率不显示（每轮用量面板没有命中率） | 上游**确实**返回 `cached_tokens`，是 DSH 前端按 `cacheRead.every(isCount)` 聚合——一轮内任一步缺 `cacheReadTokens` 就整块隐藏。v2.0.3 已改为**恒输出**（未命中写 0）。升级后 `costMeter` 也能记到准确的 `cacheRead` 桶 |
 | PowerShell 输出中文乱码导致路径损坏 | 已在生成的脚本里强制 `[Console]::OutputEncoding=UTF8`（PS 5.1 默认 GBK） |
+| Windows 程序报 `cannot execute binary file: Exec format error` | WSL interop 的 binfmt 注册（`/proc/sys/fs/binfmt_misc/WSLInterop`）丢失。v2.0.3 起自动检测并改走 `/init <exe> <args...>` 转发；彻底修复需 root 重新注册 binfmt |
 
 ## 隐私 / 安全说明
 
